@@ -4,6 +4,8 @@ import html
 from email import policy
 from email.parser import BytesParser
 import subprocess
+import tempfile
+import uuid
 from PIL import Image, ImageFont, ImageDraw
 from dotenv import load_dotenv
 
@@ -41,11 +43,30 @@ class FanficProcessingError(CalibreError):
 
 
 def convert_to_epub(book_path: str, name_book: str, output_dir: str = CONVERTED_DIR):
+    output = os.path.join(output_dir, f"{safe_filename(name_book)}{FORMAT_OUTPUT}")
     try:
-        output = f"{output_dir}/{name_book}{FORMAT_OUTPUT}"
-        subprocess.run(["ebook-convert", f"{book_path}", f"{output}"], check=True)
+        os.makedirs(output_dir, exist_ok=True)
+        result = subprocess.run(
+            ["ebook-convert", book_path, output],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise ConversionError(
+            "No se encontró ebook-convert. Verifica que Calibre esté instalado "
+            "en el contenedor."
+        ) from e
     except subprocess.CalledProcessError as e:
-        raise ConversionError(f"Error al convertir el archivo: {e}")
+        details = (e.stderr or e.stdout or "Calibre no devolvió detalles.").strip()
+        raise ConversionError(f"Calibre no pudo convertir el archivo: {details}") from e
+    except OSError as e:
+        raise ConversionError(f"No se pudo iniciar ebook-convert: {e}") from e
+    if not os.path.isfile(output):
+        details = (result.stderr or result.stdout or "sin detalles").strip()
+        raise ConversionError(
+            f"Calibre terminó sin crear el EPUB esperado ({output}). {details}"
+        )
     return output
 
 
@@ -54,11 +75,30 @@ async def send_to_library(book_file, book_name: str):
     ninguna conversión. Calibre-Web-Automated lo recoge automáticamente
     y lo agrega a la biblioteca."""
     try:
-        destination = f"{CWA_INGEST_DIR}/{book_name}"
+        os.makedirs(CWA_INGEST_DIR, exist_ok=True)
+        safe_stem = safe_filename(os.path.splitext(os.path.basename(book_name))[0])
+        extension = os.path.splitext(book_name)[1].lower()
+        destination = os.path.join(CWA_INGEST_DIR, f"{safe_stem}{extension}")
+        if os.path.exists(destination):
+            destination = os.path.join(
+                CWA_INGEST_DIR, f"{safe_stem}-{uuid.uuid4().hex[:8]}{extension}"
+            )
         await book_file.download_to_drive(destination)
+    except OSError as e:
+        raise ConversionError(
+            f"No se pudo guardar el archivo en la carpeta de importación "
+            f"'{CWA_INGEST_DIR}': {e}"
+        ) from e
     except Exception as e:
-        raise ConversionError(f"Error al enviar el archivo a la biblioteca: {e}")
+        raise ConversionError(f"Falló la descarga del archivo: {e}") from e
     return destination
+
+
+def safe_filename(value: str) -> str:
+    """Return a portable filename component without path or control chars."""
+    value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return value[:120] or "book"
 
 
 def _extract_ao3_metadata(content: str) -> tuple[str, str, str]:
@@ -154,13 +194,6 @@ def tranform_fanfic(fanfic_file: str, name_fanfic: str | None = None):
         subcontent = content[start_index:end_index]
         modified_subcontent = subcontent.replace("Texto del capítulo", "Capítulo")
 
-        transform_dir = "books/random"
-        os.makedirs(transform_dir, exist_ok=True)
-        transform_path = os.path.join(transform_dir, f"{source_name}.html")
-
-        with open(transform_path, "w", encoding="utf-8") as modified_file:
-            modified_file.write(modified_subcontent)
-
         serie = insert_jump(series, "\n", 3)
         title = insert_jump(title, "\n", 3)
 
@@ -168,14 +201,20 @@ def tranform_fanfic(fanfic_file: str, name_fanfic: str | None = None):
         other_name = re.sub(r"[\\/:*?\"<>|\n\r]+", " ", modified_name)
         other_name = re.sub(r"\s+", " ", other_name).strip(" .")
 
-        modified_path = convert_to_epub(
-            transform_path, other_name, output_dir=CWA_INGEST_DIR
-        )
+        transform_dir = "books/random"
+        os.makedirs(transform_dir, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="kind3bot-fanfic-", dir=transform_dir
+        ) as work_dir:
+            transform_path = os.path.join(work_dir, "fanfic.html")
+            with open(transform_path, "w", encoding="utf-8") as modified_file:
+                modified_file.write(modified_subcontent)
+
+            modified_path = convert_to_epub(
+                transform_path, other_name, output_dir=CWA_INGEST_DIR
+            )
         metedata_fanfic(modified_path, title.replace("\n", " "), author, series)
-        try:
-            manage_covert(modified_path, modified_name, True)
-        except Exception as e:
-            raise FanficProcessingError(f"No se pudo generar la portada: {e}")
+        manage_covert(modified_path, modified_name, True)
 
     except FileNotFoundError:
         raise FanficProcessingError(
@@ -185,8 +224,10 @@ def tranform_fanfic(fanfic_file: str, name_fanfic: str | None = None):
         raise FanficProcessingError(f"Error de E/S al manejar el archivo: {e}")
     except ValueError as e:
         raise FanficProcessingError(f"Error en el contenido del archivo: {e}")
+    except CalibreError:
+        raise
     except Exception as e:
-        raise FanficProcessingError(f"Ocurrió un error inesperado: {e}")
+        raise FanficProcessingError(f"Falló el procesamiento del fanfic: {e}") from e
     return None
 
 
@@ -209,8 +250,16 @@ def metedata_fanfic(fanfic_path: str, title: str, author: str, series: str):
             ],
             check=True,
         )
+    except FileNotFoundError as e:
+        raise FanficProcessingError(
+            "No se encontró ebook-meta. Verifica que Calibre esté instalado "
+            "en el contenedor."
+        ) from e
     except subprocess.CalledProcessError as e:
-        raise FanficProcessingError(f"No se pudieron guardar los metadatos: {e}")
+        details = (e.stderr or e.stdout or "Calibre no devolvió detalles.").strip()
+        raise FanficProcessingError(
+            f"No se pudieron guardar los metadatos: {details}"
+        ) from e
     return None
 
 
@@ -236,14 +285,18 @@ def manage_covert(book_path: str, name_book: str, fanfic: bool = False):
 
         dibujo.text(posicion, texto, font=fuente, fill=color_texto, anchor="mm")
 
-        path_image = f"coverts/{name_book}.jpg"
+        cover_dir = "coverts"
+        os.makedirs(cover_dir, exist_ok=True)
+        safe_cover_name = re.sub(r"[\\/:*?\"<>|\n\r]+", " ", name_book)
+        safe_cover_name = re.sub(r"\s+", " ", safe_cover_name).strip(" .")
+        path_image = os.path.join(cover_dir, f"{safe_cover_name}.jpg")
         imagen_base.save(path_image)
 
-        subprocess.run(["ebook-meta", book_path, "--cover", path_image])
+        _run_ebook_meta(book_path, "--cover", path_image)
     else:
         path_image = f"coverts/{name_book}.jpg"
 
-        subprocess.run(["ebook-meta", book_path, "--get-cover", path_image])
+        _run_ebook_meta(book_path, "--get-cover", path_image)
 
         imagen = Image.open(path_image)
         ancho, alto = imagen.size
@@ -252,9 +305,29 @@ def manage_covert(book_path: str, name_book: str, fanfic: bool = False):
             img_resize = imagen.resize((600, 900))
             img_resize.save(path_image)
 
-            subprocess.run(["ebook-meta", book_path, "--cover", path_image])
+            _run_ebook_meta(book_path, "--cover", path_image)
 
     return None
+
+
+def _run_ebook_meta(book_path: str, *args: str):
+    try:
+        subprocess.run(
+            ["ebook-meta", book_path, *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise FanficProcessingError(
+            "No se encontró ebook-meta. Verifica que Calibre esté instalado "
+            "en el contenedor."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        details = (e.stderr or e.stdout or "Calibre no devolvió detalles.").strip()
+        raise FanficProcessingError(f"ebook-meta falló: {details}") from e
+    except OSError as e:
+        raise FanficProcessingError(f"No se pudo iniciar ebook-meta: {e}") from e
 
 
 def get_name(book_path: str, fanfic: bool = False):

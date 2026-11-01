@@ -1,5 +1,7 @@
 import os
 import logging
+import tempfile
+import uuid
 import calibre as cb
 from dotenv import load_dotenv, find_dotenv
 from telegram import Update
@@ -162,7 +164,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     book_name = document.file_name or "unknown"
-    book_type = book_name[book_name.rfind(".") :]
+    book_type = os.path.splitext(book_name)[1].lower()
 
     try:
         book_file = await context.bot.get_file(document.file_id)
@@ -174,10 +176,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text="ℹ️ That's already an EPUB — use /library instead.",
                 )
             else:
-                book_path = f"books/random/{book_name}"
-                only_name = cb.get_name(book_path)
-                await book_file.download_to_drive(book_path)
-                cb.convert_to_epub(book_path, only_name)
+                working_dir = "books/random"
+                os.makedirs(working_dir, exist_ok=True)
+                safe_stem = cb.safe_filename(os.path.splitext(book_name)[0])
+                output_name = f"{safe_stem}-{uuid.uuid4().hex[:8]}"
+                with tempfile.NamedTemporaryFile(
+                    dir=working_dir, suffix=book_type, delete=False
+                ) as temporary_file:
+                    book_path = temporary_file.name
+                try:
+                    await book_file.download_to_drive(book_path)
+                    cb.convert_to_epub(book_path, output_name)
+                finally:
+                    if os.path.exists(book_path):
+                        os.remove(book_path)
                 await context.bot.send_message(
                     chat_id=chat.id,
                     text="✅ Converted to EPUB and sent to your library. "
@@ -191,10 +203,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text="❌ Send the AO3 page saved as .mht, .mhtml, .html, or .htm.",
                 )
                 return
-            safe_filename = os.path.basename(book_name)
-            fanfic_path = f"books/random/raw/{safe_filename}"
-            await book_file.download_to_drive(fanfic_path)
-            cb.tranform_fanfic(fanfic_path)
+            working_dir = "books/random"
+            os.makedirs(working_dir, exist_ok=True)
+            file_suffix = os.path.splitext(book_name)[1].lower()
+            with tempfile.NamedTemporaryFile(
+                dir=working_dir, suffix=file_suffix, delete=False
+            ) as temporary_file:
+                fanfic_path = temporary_file.name
+            try:
+                await book_file.download_to_drive(fanfic_path)
+                cb.tranform_fanfic(fanfic_path)
+            finally:
+                if os.path.exists(fanfic_path):
+                    os.remove(fanfic_path)
             await context.bot.send_message(
                 chat_id=chat.id,
                 text="✅ FanFic processed and sent to your library. It "
@@ -224,6 +245,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except cb.FanficProcessingError as e:
         await context.bot.send_message(
             chat_id=chat.id, text=f"❌ Error processing FanFic: {e}"
+        )
+    except OSError as e:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"❌ File operation failed: {e}",
         )
     except Exception as e:
         await context.bot.send_message(
