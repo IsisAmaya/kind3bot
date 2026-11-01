@@ -1,4 +1,8 @@
 import os
+import re
+import html
+from email import policy
+from email.parser import BytesParser
 import subprocess
 from PIL import Image, ImageFont, ImageDraw
 from dotenv import load_dotenv
@@ -57,10 +61,87 @@ async def send_to_library(book_file, book_name: str):
     return destination
 
 
-def tranform_fanfic(fanfic_file: str, name_fanfic: str):
+def _extract_ao3_metadata(content: str) -> tuple[str, str, str]:
+    """Read title, author, and series from an AO3 downloaded HTML page."""
+    title_match = re.search(
+        r'<h2[^>]*class=["\'][^"\']*\btitle\b[^"\']*["\'][^>]*>(.*?)</h2>',
+        content,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not title_match:
+        raise FanficProcessingError("No se encontró el título en el HTML de AO3.")
+    title = html.unescape(re.sub(r"<[^>]+>", " ", title_match.group(1)))
+    title = re.sub(r"\s+", " ", title).strip()
+
+    author_match = re.search(
+        r'<a[^>]*rel=["\']author["\'][^>]*>(.*?)</a>',
+        content,
+        re.IGNORECASE | re.DOTALL,
+    )
+    author = "Anonymous" if not author_match else html.unescape(
+        re.sub(r"<[^>]+>", " ", author_match.group(1))
+    )
+    author = re.sub(r"\s+", " ", author).strip()
+    if not author:
+        author = "Anonymous"
+
+    series_match = re.search(
+        r'<dd[^>]*class=["\'][^"\']*\bseries\b[^"\']*["\'][^>]*>(.*?)</dd>',
+        content,
+        re.IGNORECASE | re.DOTALL,
+    )
+    series = "" if not series_match else series_match.group(1)
+    if series:
+        series_link = re.search(r"<a\b[^>]*>(.*?)</a>", series, re.IGNORECASE | re.DOTALL)
+        if series_link:
+            series = series_link.group(1)
+    series = html.unescape(re.sub(r"<[^>]+>", " ", series))
+    series = re.sub(r"\s+", " ", series).strip()
+
+    # Browser-saved AO3 MHT pages preserve the original command metadata in
+    # the document title: "Work title - Author - Fandom [extra]". Prefer it
+    # over AO3's series block, which describes a collection rather than fandom.
+    document_title = re.search(r"<title[^>]*>(.*?)</title>", content, re.I | re.S)
+    if document_title:
+        title_parts = html.unescape(
+            re.sub(r"\s+", " ", document_title.group(1))
+        ).strip().split(" - ", 2)
+        if len(title_parts) == 3:
+            title, author, series = (part.strip() for part in title_parts)
+
+    return title, author, series
+
+
+def tranform_fanfic(fanfic_file: str, name_fanfic: str | None = None):
     try:
-        with open(fanfic_file, "r", encoding="utf-8", errors="ignore") as base_file:
-            content = base_file.read()
+        with open(fanfic_file, "rb") as base_file:
+            raw_content = base_file.read()
+        if fanfic_file.lower().endswith((".mht", ".mhtml")):
+            message = BytesParser(policy=policy.default).parsebytes(raw_content)
+            html_part = next(
+                (part for part in message.walk() if part.get_content_type() == "text/html"),
+                None,
+            )
+            if html_part is None:
+                raise FanficProcessingError("El archivo MHT no contiene una página HTML.")
+            html_bytes = html_part.get_payload(decode=True)
+            charset_match = re.search(
+                rb"charset\s*=\s*[\"']?([\w.-]+)", html_bytes[:4096], re.IGNORECASE
+            )
+            charset = charset_match.group(1).decode("ascii") if charset_match else "utf-8"
+            content = html_bytes.decode(charset, errors="replace")
+        else:
+            content = raw_content.decode("utf-8", errors="replace")
+
+        title, author, series = _extract_ao3_metadata(content)
+        source_name = name_fanfic or os.path.splitext(os.path.basename(fanfic_file))[0]
+        if name_fanfic and " - " in name_fanfic:
+            # Preserve the old API for callers that still pass metadata.
+            parts = name_fanfic.split("-", 2)
+            if len(parts) == 3:
+                title, author, series = (part.strip() for part in parts)
+        if not series:
+            series = title
 
         start_index = content.find("<!-- END navigation -->")
         end_index = content.find("<!-- END work -->")
@@ -73,23 +154,28 @@ def tranform_fanfic(fanfic_file: str, name_fanfic: str):
         subcontent = content[start_index:end_index]
         modified_subcontent = subcontent.replace("Texto del capítulo", "Capítulo")
 
-        transform_path = f"books/random/{name_fanfic}.html"
+        transform_dir = "books/random"
+        os.makedirs(transform_dir, exist_ok=True)
+        transform_path = os.path.join(transform_dir, f"{source_name}.html")
 
         with open(transform_path, "w", encoding="utf-8") as modified_file:
             modified_file.write(modified_subcontent)
 
-        list_name = name_fanfic.split("-")
-        serie = insert_jump(list_name[2][0 : list_name[2].find("[")], "\n", 3)
-        title = insert_jump(list_name[0], "\n", 3)
+        serie = insert_jump(series, "\n", 3)
+        title = insert_jump(title, "\n", 3)
 
         modified_name = title + "-" + serie
-        other_name = modified_name.replace("\n", "").replace("\r", "")
+        other_name = re.sub(r"[\\/:*?\"<>|\n\r]+", " ", modified_name)
+        other_name = re.sub(r"\s+", " ", other_name).strip(" .")
 
         modified_path = convert_to_epub(
             transform_path, other_name, output_dir=CWA_INGEST_DIR
         )
-        metedata_fanfic(modified_path, name_fanfic)
-        manage_covert(modified_path, modified_name, True)
+        metedata_fanfic(modified_path, title.replace("\n", " "), author, series)
+        try:
+            manage_covert(modified_path, modified_name, True)
+        except Exception as e:
+            raise FanficProcessingError(f"No se pudo generar la portada: {e}")
 
     except FileNotFoundError:
         raise FanficProcessingError(
@@ -104,29 +190,27 @@ def tranform_fanfic(fanfic_file: str, name_fanfic: str):
     return None
 
 
-def metedata_fanfic(fanfic_path: str, name_fanfic: str):
+def metedata_fanfic(fanfic_path: str, title: str, author: str, series: str):
     try:
-        list_file_name = name_fanfic.split("-")
-        series = list_file_name[2][0 : list_file_name[2].find("[")]
-
         subprocess.run(
             [
                 "ebook-meta",
                 fanfic_path,
                 "-a",
-                list_file_name[1],
+                author,
                 "-t",
-                list_file_name[0],
+                title,
                 "--tags",
                 "FanFiction",
                 "-p",
                 "Archive of Our Own",
                 "-s",
                 series,
-            ]
+            ],
+            check=True,
         )
     except subprocess.CalledProcessError as e:
-        print(e.output)
+        raise FanficProcessingError(f"No se pudieron guardar los metadatos: {e}")
     return None
 
 

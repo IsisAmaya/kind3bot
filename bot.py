@@ -37,7 +37,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "I help you get eBooks into your Calibre-Web library. Pick an "
         "action first, then send me the file:\n\n"
         "• /convert — convert a file to EPUB and add it to your library\n"
-        "• /fanfic — format a raw AO3 FanFic and add it to your library\n"
+        "• /fanfic — format a saved AO3 FanFic (.mht) and add it to your library\n"
         "• /library — send a file straight to your library, no conversion\n"
         "• /cancel — cancel the pending action\n\n"
         "Use /help for details on each one. 😊"
@@ -56,9 +56,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. */convert*\n"
         "   - Run the command, then send the file.\n"
         "   - I'll convert it to EPUB and add it to your library.\n\n"
-        "2. */fanfic Title - Author - Series[extra]*\n"
-        "   - Run the command with the metadata as arguments, then send "
-        "the raw AO3 file.\n"
+        "2. */fanfic*\n"
+        "   - Run the command, then send the AO3 page saved as an .mht file.\n"
+        "   - I'll read the title, author, and series from the file.\n"
         "   - I'll format it, generate a cover, and add it to your "
         "library.\n\n"
         "3. */library*\n"
@@ -80,7 +80,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_action", None)
-    context.user_data.pop("fanfic_name", None)
     if update.effective_chat:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -126,20 +125,11 @@ async def fanfic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat.id, text="🚫 Access denied.")
         return
 
-    if not context.args:
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text="❌ Usage: /fanfic Title - Author - Series[extra]",
-        )
-        return
-
-    fanfic_name = " ".join(context.args)
     context.user_data["pending_action"] = "fanfic"
-    context.user_data["fanfic_name"] = fanfic_name
     await context.bot.send_message(
         chat_id=chat.id,
-        text=f"📥 Got it: *{fanfic_name}*.\nNow send me the raw FanFic file.",
-        parse_mode="Markdown",
+        text="📥 Send me the AO3 page saved as an .mht file. I'll get the title, author, "
+        "and series from the file.",
     )
 
 
@@ -195,10 +185,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         elif pending_action == "fanfic":
-            fanfic_name = context.user_data.get("fanfic_name")
-            fanfic_path = f"books/random/raw/{fanfic_name}"
+            if book_type.lower() not in (".html", ".htm", ".mht", ".mhtml"):
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text="❌ Send the AO3 page saved as .mht, .mhtml, .html, or .htm.",
+                )
+                return
+            safe_filename = os.path.basename(book_name)
+            fanfic_path = f"books/random/raw/{safe_filename}"
             await book_file.download_to_drive(fanfic_path)
-            cb.tranform_fanfic(fanfic_path, fanfic_name)
+            cb.tranform_fanfic(fanfic_path)
             await context.bot.send_message(
                 chat_id=chat.id,
                 text="✅ FanFic processed and sent to your library. It "
@@ -235,7 +231,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     finally:
         context.user_data.pop("pending_action", None)
-        context.user_data.pop("fanfic_name", None)
 
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
