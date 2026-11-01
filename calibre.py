@@ -194,7 +194,8 @@ def tranform_fanfic(fanfic_file: str, name_fanfic: str | None = None):
         subcontent = content[start_index:end_index]
         modified_subcontent = subcontent.replace("Texto del capítulo", "Capítulo")
 
-        serie = insert_jump(series, "\n", 3)
+        display_series = series.split("[", 1)[0].strip()
+        serie = insert_jump(display_series, "\n", 3)
         title = insert_jump(title, "\n", 3)
 
         modified_name = title + "-" + serie
@@ -213,7 +214,12 @@ def tranform_fanfic(fanfic_file: str, name_fanfic: str | None = None):
             modified_path = convert_to_epub(
                 transform_path, other_name, output_dir=CWA_INGEST_DIR
             )
-        metedata_fanfic(modified_path, title.replace("\n", " "), author, series)
+        metedata_fanfic(
+            modified_path,
+            title.replace("\n", " "),
+            author,
+            display_series,
+        )
         manage_covert(modified_path, modified_name, True)
 
     except FileNotFoundError:
@@ -269,21 +275,12 @@ def manage_covert(book_path: str, name_book: str, fanfic: bool = False):
         dibujo = ImageDraw.Draw(imagen_base)
 
         try:
-            fuente = ImageFont.truetype(
-                "templ/FiraSans-SemiBoldItalic.ttf", 43
-            )  # Cambia "arial.ttf" por la ruta a tu fuente
+            fuente = ImageFont.truetype("templ/FiraSans-SemiBoldItalic.ttf", 43)
         except IOError:
             fuente = ImageFont.load_default()
 
-        texto = name_book.replace("-", "\n")
-        texto = "   " + texto
-
-        posicion = (300, 300)
-
-        # Color del texto (en formato RGB)
-        color_texto = (0, 0, 0)  # Blanco
-
-        dibujo.text(posicion, texto, font=fuente, fill=color_texto, anchor="mm")
+        title_text, series_text = name_book.split("-", 1)
+        draw_cover_text(dibujo, title_text.strip(), series_text.strip(), fuente)
 
         cover_dir = "coverts"
         os.makedirs(cover_dir, exist_ok=True)
@@ -308,6 +305,58 @@ def manage_covert(book_path: str, name_book: str, fanfic: bool = False):
             _run_ebook_meta(book_path, "--cover", path_image)
 
     return None
+
+
+def draw_cover_text(draw: ImageDraw.ImageDraw, title: str, series: str, font):
+    """Draw supported glyphs and wrap cover text to the available width."""
+    max_width = 520
+    lines = []
+    for section in (title, series):
+        section = _remove_unsupported_glyphs(section, font)
+        words = section.split()
+        line = ""
+        for word in words:
+            candidate = f"{line} {word}".strip()
+            if line and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        if line:
+            lines.append(line)
+
+    line_height = draw.textbbox((0, 0), "Ag", font=font)[3] + 8
+    max_lines = 7
+    if len(lines) > max_lines:
+        lines = lines[: max_lines - 1] + [lines[max_lines - 1].rstrip(" .") + "…"]
+    text = "\n".join(lines)
+    draw.multiline_text(
+        (300, 305),
+        text,
+        font=font,
+        fill=(0, 0, 0),
+        anchor="mm",
+        align="center",
+        spacing=max(2, line_height // 8),
+    )
+
+
+def _remove_unsupported_glyphs(text: str, font) -> str:
+    """Drop characters that the selected Pillow font cannot render."""
+    supported = []
+    replacement_mask = bytes(font.getmask("\ufffd"))
+    for character in text:
+        if character.isspace():
+            supported.append(character)
+            continue
+        try:
+            glyph_mask = bytes(font.getmask(character))
+        except (UnicodeEncodeError, OSError, ValueError):
+            continue
+        if glyph_mask == replacement_mask:
+            continue
+        supported.append(character)
+    return re.sub(r"\s+", " ", "".join(supported)).strip()
 
 
 def _run_ebook_meta(book_path: str, *args: str):
